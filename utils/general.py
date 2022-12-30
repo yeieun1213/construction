@@ -1014,6 +1014,17 @@ def print_mutation(keys, results, hyp, save_dir, bucket, prefix=colorstr('evolve
     if bucket:
         os.system(f'gsutil cp {evolve_csv} {evolve_yaml} gs://{bucket}')  # upload
 
+def detect_ppe(img, model):
+    from utils.augmentations import letterbox
+    x = letterbox(img)[0]
+    x = x[:, :, ::-1].transpose(2, 0, 1)
+    x = np.ascontiguousarray(x)
+    x = torch.from_numpy(x).float().to('cpu')
+    x /= 255.0
+    x = x.unsqueeze(0)
+    pred = model(x, augment=False)[0]
+
+    return pred, x.shape
 
 def apply_classifier(x, model, img, im0):
     # Apply a second stage classifier to YOLO outputs

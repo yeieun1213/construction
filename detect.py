@@ -43,14 +43,37 @@ from models.common import DetectMultiBackend
 from utils.dataloaders import IMG_FORMATS, VID_FORMATS, LoadImages, LoadScreenshots, LoadStreams
 from utils.general import (LOGGER, Profile, check_file, check_img_size, check_imshow, check_requirements, colorstr, cv2,
                            increment_path, non_max_suppression, print_args, scale_boxes, strip_optimizer, xyxy2xywh)
-from utils.plots import Annotator, colors, save_one_box
+from utils.general import detect_ppe
+from utils.plots import Annotator, colors, colors_ppe, save_one_box
 from utils.torch_utils import select_device, smart_inference_mode
 
+from numpy import uint8
+
+def danger(lines, xyxy, safety):
+    x1, y1, x2, y2 = lines
+    center_x, center_y = (xyxy[0] + xyxy[2]) / 2, (xyxy[1] + xyxy[3]) / 2
+    m = (y2 - y1) / (x2 - x1) if (x1 != x2) else None
+
+    if m:
+        y_upper = (-1 / m) * (center_x - x1) + y1
+        y_lower = (-1 / m) * (center_x - x2) + y2
+        b = y1 - m * x1
+        y = m * center_x + b
+    else: # m == None
+        y_upper, y_lower = float('inf'), float('-inf')
+        y = x1
+
+    if y_lower <= center_y <= y_upper or y_upper <= center_y <= y_lower:
+        if (center_y < y and safety == 1) or (center_y > y and safety == 0):
+            LOGGER.warning('DANGEROUS')
+            return 0, int(center_x), int(center_y)
+    # LOGGER.info('safe')
+    return 1, int(center_x), int(center_y)
 
 @smart_inference_mode()
 def run(
         weights=ROOT / 'yolov5s.pt',  # model path or triton URL
-        source=ROOT / 'data/images',  # file/dir/URL/glob/screen/0(webcam)
+        source=ROOT / 'test.jpg',  # file/dir/URL/glob/screen/0(webcam)
         data=ROOT / 'data/coco128.yaml',  # dataset.yaml path
         imgsz=(640, 640),  # inference size (height, width)
         conf_thres=0.25,  # confidence threshold
@@ -76,6 +99,12 @@ def run(
         half=False,  # use FP16 half-precision inference
         dnn=False,  # use OpenCV DNN for ONNX inference
         vid_stride=1,  # video frame-rate stride
+        weights_ppe='best_ppe.pt', # model for ppe path
+        data_ppe='data/ppe.yaml', # dataset for ppe yaml path
+        lines = [10, 10, 50, 50], # random line to detect danger
+        safety = 0, # for safety zone
+        weights_heavy='best_heavy.pt',
+        data_heavy='data/heavy.yaml'
 ):
     source = str(source)
     save_img = not nosave and not source.endswith('.txt')  # save inference images
@@ -92,8 +121,13 @@ def run(
 
     # Load model
     device = select_device(device)
-    model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
-    stride, names, pt = model.stride, model.names, model.pt
+    model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half) # for people
+    model_ppe = DetectMultiBackend(weights_ppe, device=device, dnn=dnn, data=data_ppe, fp16=half) # for ppe
+    model_heavy = DetectMultiBackend(weights_heavy, device=device, dnn=dnn, data=data_heavy, fp16=half) # for heavy equipment
+    LOGGER.info("Detect ppe Model: {}".format(weights_ppe))
+    stride, names, pt = model.stride, model.names, model.pt # for people
+    stride_ppe, names_ppe, pt_ppe = model_ppe.stride, model_ppe.names, model_ppe.pt # for ppe
+    stride_heavy, names_heavy, pt_heavy = model_heavy.stride, model_heavy.names, model_heavy.pt
     imgsz = check_img_size(imgsz, s=stride)  # check image size
 
     # Dataloader
@@ -123,13 +157,12 @@ def run(
         with dt[1]:
             visualize = increment_path(save_dir / Path(path).stem, mkdir=True) if visualize else False
             pred = model(im, augment=augment, visualize=visualize)
+            pred_heavy = model(im, augment=augment, visualize=visualize)
 
         # NMS
         with dt[2]:
             pred = non_max_suppression(pred, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
-
-        # Second-stage classifier (optional)
-        # pred = utils.general.apply_classifier(pred, classifier_model, im, im0s)
+            pred_heavy = non_max_suppression(pred_heavy, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det)
 
         # Process predictions
         for i, det in enumerate(pred):  # per image
@@ -147,6 +180,7 @@ def run(
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness, example=str(names))
+            cv2.line(im0, (lines[0], lines[1]), (lines[2], lines[3]), (0, 0, 255), thickness=2)  # red line
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
@@ -156,8 +190,14 @@ def run(
                     n = (det[:, 5] == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
+                # variable list to detect ppe
+                images = []
+                xyxy_list = []
+
                 # Write results
                 for *xyxy, conf, cls in reversed(det):
+                    c = int(cls)  # integer class
+                    if c > 0: continue # to only people, if you use model to detect only poeple, remove this line.
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
                         line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
@@ -165,18 +205,96 @@ def run(
                             f.write(('%g ' * len(line)).rstrip() % line + '\n')
 
                     if save_img or save_crop or view_img:  # Add bbox to image
-                        c = int(cls)  # integer class
                         label = None if hide_labels else (names[c] if hide_conf else f'{names[c]} {conf:.2f}')
-                        annotator.box_label(xyxy, label, color=colors(c, True))
+                        safe, center_x, center_y = danger(lines, xyxy, safety) # detect danger of people
+                        cv2.line(im0, (center_x, center_y), (center_x, center_y), color=(0, 0, 255), thickness=10) # center of person
+                        # color will change depending on the risk.
+                        # If the person is in danger, the box is red. If the person is in safety, the box is green.
+                        annotator.box_label(xyxy, label, color=colors(safe, True))
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / 'crops' / names[c] / f'{p.stem}.jpg', BGR=True)
 
+                    # Add people images to images list and axis to xyxy_list
+                    x1, y1, x2, y2 = xyxy
+                    images.append(im0.astype(uint8)[int(y1):int(y2), int(x1):int(x2)])
+                    xyxy_list.append(xyxy[:2]+xyxy[:2])
+
+                    # detect ppe per one person
+                    for j, image in enumerate(images):
+                        annotator_ppe = Annotator(im0, line_width=line_thickness, example=str(names_ppe)) # annotator for ppe
+                        pred_ppe, x_shape = detect_ppe(image, model_ppe) # detect ppe
+                        pred_ppe = non_max_suppression(pred_ppe, conf_thres, iou_thres, classes, agnostic_nms, max_det=max_det) # pick ppe with high conf_thres and iou_thres
+                        # draw ppe box in the image
+                        for i_ppe, det_ppe in enumerate(pred_ppe):
+                            det_ppe[:, :4] = scale_boxes(x_shape[2:], det_ppe[:, :4], image.shape).round()
+                            for *xyxy, conf, cls in reversed(det_ppe):
+                                c_ppe = int(cls)
+                                label_ppe = f'{names_ppe[c_ppe]} {conf:.2f}'
+                                xyxy = [a+b for a,b in zip(xyxy, xyxy_list[j])]
+                                annotator_ppe.box_label(xyxy, label_ppe, color=colors_ppe(c_ppe, True))
+
+
+            # # Stream results
+            # im0 = annotator.result()
+            # if view_img:
+            #     if platform.system() == 'Linux' and p not in windows:
+            #         windows.append(p)
+            #         cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
+            #         cv2.resizeWindow(str(p), im0.shape[1], im0.shape[0])
+            #     cv2.imshow(str(p), im0)
+            #     cv2.waitKey(1)  # 1 millisecond
+            #
+            # # Save results (image with detections)
+            # if save_img:
+            #     if dataset.mode == 'image':
+            #         cv2.imwrite(save_path, im0)
+            #     else:  # 'video' or 'stream'
+            #         if vid_path[i] != save_path:  # new video
+            #             vid_path[i] = save_path
+            #             if isinstance(vid_writer[i], cv2.VideoWriter):
+            #                 vid_writer[i].release()  # release previous video writer
+            #             if vid_cap:  # video
+            #                 fps = vid_cap.get(cv2.CAP_PROP_FPS)
+            #                 w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            #                 h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            #             else:  # stream
+            #                 fps, w, h = 30, im0.shape[1], im0.shape[0]
+            #             save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
+            #             vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+            #         vid_writer[i].write(im0)
+
+
+        for i, det in enumerate(pred_heavy):
+            annotator_heavy = Annotator(im0, line_width=line_thickness, example=str(names_heavy))
+            if len(det):
+                det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
+
+                for c in det[:, 5].unique():
+                    n = (det[:, 5] == c).sum()  # detections per class
+                    s += f"{n} {names_heavy[int(c)]}{'s' * (n > 1)}, "  # add to string
+
+                    # Write results
+                    for *xyxy, conf, cls in reversed(det):
+                        c = int(cls)  # integer class
+                        if save_txt:  # Write to file
+                            xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
+                            line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
+                            with open(f'{txt_path}.txt', 'a') as f:
+                                f.write(('%g ' * len(line)).rstrip() % line + '\n')
+
+                        if save_img or save_crop or view_img:  # Add bbox to image
+                            label = None if hide_labels else (names_heavy[c] if hide_conf else f'{names_heavy[c]} {conf:.2f}')
+                        if save_crop:
+                            save_one_box(xyxy, imc, file=save_dir / 'crops' / names_heavy[c] / f'{p.stem}.jpg', BGR=True)
+
             # Stream results
-            im0 = annotator.result()
+            # im0 = annotator.result()
+            im0 = annotator_heavy.result()
             if view_img:
                 if platform.system() == 'Linux' and p not in windows:
                     windows.append(p)
-                    cv2.namedWindow(str(p), cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
+                    cv2.namedWindow(str(p),
+                                    cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)  # allow window resize (Linux)
                     cv2.resizeWindow(str(p), im0.shape[1], im0.shape[0])
                 cv2.imshow(str(p), im0)
                 cv2.waitKey(1)  # 1 millisecond
@@ -196,9 +314,11 @@ def run(
                             h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
                         else:  # stream
                             fps, w, h = 30, im0.shape[1], im0.shape[0]
-                        save_path = str(Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
+                        save_path = str(
+                            Path(save_path).with_suffix('.mp4'))  # force *.mp4 suffix on results videos
                         vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
                     vid_writer[i].write(im0)
+
 
         # Print time (inference-only)
         LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1E3:.1f}ms")
@@ -216,7 +336,7 @@ def run(
 def parse_opt():
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolov5s.pt', help='model path or triton URL')
-    parser.add_argument('--source', type=str, default=ROOT / 'data/images', help='file/dir/URL/glob/screen/0(webcam)')
+    parser.add_argument('--source', type=str, default=ROOT / 'test.jpg', help='file/dir/URL/glob/screen/0(webcam)')
     parser.add_argument('--data', type=str, default=ROOT / 'data/coco128.yaml', help='(optional) dataset.yaml path')
     parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
     parser.add_argument('--conf-thres', type=float, default=0.25, help='confidence threshold')
@@ -242,6 +362,12 @@ def parse_opt():
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     parser.add_argument('--vid-stride', type=int, default=1, help='video frame-rate stride')
+    parser.add_argument('--weights_ppe', default='best_ppe.pt', help='model path to detect ppe')
+    parser.add_argument('--data_ppe', default='data/ppe.yaml', help='dataset.yaml path to detect ppe')
+    parser.add_argument('--lines', nargs=4, type=int, default=[300, 400, 350, 10],help='lines to tell if someone is in safe zone or dangerous zone')
+    parser.add_argument('--safety', type=int, default=0, help='which zone is safety')
+    parser.add_argument('--weights_heavy', defualt='best_heavy.pt', help='model path to detect heavy equipment')
+    parser.add_argument('--data_heavy', default='data/heavy.yaml', help='dataset.yaml path to detect heavy equipment')
     opt = parser.parse_args()
     opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
     print_args(vars(opt))

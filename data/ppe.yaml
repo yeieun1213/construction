@@ -1,0 +1,8 @@
+#names: ['with_hook', 'without_hook', 'with_shoe', 'without_shoe', 'with_helmet', 'without_helmet']
+names:
+  0: with_hook
+  1: without_hook
+  2: with_shoe
+  3: without_shoe
+  4: with_helmet
+  5: without_helmet
